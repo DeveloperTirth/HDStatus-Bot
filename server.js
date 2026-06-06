@@ -8,10 +8,19 @@ const { execFile } = require("child_process");
 const ffprobeStatic = require("ffprobe-static");
 const { v4: uuidv4 } = require("uuid");
 
+// ── GLOBAL PROCESS CRASH PROTECTION ─────────────────────────────────────────
+process.on("uncaughtException", (err) => {
+  console.error("[Fatal] Uncaught Exception:", err?.message || err, err?.stack);
+});
+
+process.on("unhandledRejection", (reason, promise) => {
+  console.error("[Fatal] Unhandled Rejection at:", promise, "reason:", reason);
+});
+
 const app = express();
 
 // ── CONFIGURATION ──────────────────────────────────────────────────────────
-const PORT = process.env.PORT || 3000; // default to port 3000 as the sole server
+const PORT = process.env.PORT || 3000; 
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "Tirth162009isbestdeveloper";
 
 // Auth directory for Baileys session persistence
@@ -40,13 +49,17 @@ app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// Admin authentication middleware
+// Admin authentication middleware with error wrapper
 const checkAdminKey = (req, res, next) => {
-  const key = req.query.key || req.body.key || req.headers["x-admin-key"];
-  if (key !== ADMIN_TOKEN) {
-    return res.status(401).json({ error: "Unauthorized: Invalid admin key" });
+  try {
+    const key = req.query.key || req.body.key || req.headers["x-admin-key"];
+    if (key !== ADMIN_TOKEN) {
+      return res.status(401).json({ error: "Unauthorized: Invalid admin key" });
+    }
+    next();
+  } catch (err) {
+    res.status(500).json({ error: "Authentication filter error" });
   }
-  next();
 };
 
 // ── WHATSAPP BOT SERVICE USING BAILEYS ──────────────────────────────────────
@@ -88,7 +101,7 @@ async function sendTextMessage(jid, text) {
   await sock.relayMessage(jid, { conversation: text }, { messageId });
 }
 
-// Start/Initialize WASocket
+// Start/Initialize WASocket (with auto auth-store corruption recovery)
 async function startWASock() {
   try {
     const { useMultiFileAuthState, DisconnectReason } = require("@whiskeysockets/baileys");
@@ -97,7 +110,20 @@ async function startWASock() {
     const QRCode = require("qrcode");
 
     console.log(`[Bot] Initializing auth store in: ${AUTH_DIR}`);
-    const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
+    
+    let state, saveCreds;
+    try {
+      const authObj = await useMultiFileAuthState(AUTH_DIR);
+      state = authObj.state;
+      saveCreds = authObj.saveCreds;
+    } catch (authInitErr) {
+      console.error("[Bot] Auth state is corrupted. Wiping store for self-recovery:", authInitErr);
+      try {
+        fs.rmSync(AUTH_DIR, { recursive: true, force: true });
+      } catch (_) {}
+      setTimeout(startWASock, 1000);
+      return;
+    }
     
     sock = makeWASocket({
       auth: state,
@@ -106,45 +132,49 @@ async function startWASock() {
     });
     
     sock.ev.on("connection.update", async (update) => {
-      const { connection, lastDisconnect, qr } = update;
-      
-      if (qr) {
-        connectionStatus = "qr";
-        try {
-          qrCodeData = await QRCode.toDataURL(qr);
-        } catch (err) {
-          console.error("[Bot] Failed to generate QR data URL:", err);
-        }
-      }
-      
-      if (connection === "connecting") {
-        connectionStatus = "connecting";
-        qrCodeData = null;
-      }
-      
-      if (connection === "open") {
-        connectionStatus = "connected";
-        qrCodeData = null;
-        connectedUser = sock.user.id.split(":")[0].split("@")[0];
-        console.log(`[Bot] WhatsApp connection successfully opened! Connected as +${connectedUser}`);
-      }
-      
-      if (connection === "close") {
-        const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
-        console.log(`[Bot] Connection closed due to:`, lastDisconnect?.error?.message, `, reconnecting:`, shouldReconnect);
+      try {
+        const { connection, lastDisconnect, qr } = update;
         
-        connectionStatus = "disconnected";
-        connectedUser = null;
-        qrCodeData = null;
-        
-        if (shouldReconnect) {
-          setTimeout(startWASock, 3000);
-        } else {
+        if (qr) {
+          connectionStatus = "qr";
           try {
-            fs.rmSync(AUTH_DIR, { recursive: true, force: true });
-          } catch (_) {}
-          setTimeout(startWASock, 1000);
+            qrCodeData = await QRCode.toDataURL(qr);
+          } catch (err) {
+            console.error("[Bot] Failed to generate QR data URL:", err);
+          }
         }
+        
+        if (connection === "connecting") {
+          connectionStatus = "connecting";
+          qrCodeData = null;
+        }
+        
+        if (connection === "open") {
+          connectionStatus = "connected";
+          qrCodeData = null;
+          connectedUser = sock.user.id.split(":")[0].split("@")[0];
+          console.log(`[Bot] WhatsApp connection successfully opened! Connected as +${connectedUser}`);
+        }
+        
+        if (connection === "close") {
+          const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
+          console.log(`[Bot] Connection closed due to:`, lastDisconnect?.error?.message, `, reconnecting:`, shouldReconnect);
+          
+          connectionStatus = "disconnected";
+          connectedUser = null;
+          qrCodeData = null;
+          
+          if (shouldReconnect) {
+            setTimeout(startWASock, 3000);
+          } else {
+            try {
+              fs.rmSync(AUTH_DIR, { recursive: true, force: true });
+            } catch (_) {}
+            setTimeout(startWASock, 1000);
+          }
+        }
+      } catch (connUpdateErr) {
+        console.error("[Bot] Error inside connection.update handler:", connUpdateErr);
       }
     });
     
@@ -257,7 +287,11 @@ async function startWASock() {
 
 // Serve admin pairing console
 app.get(["/", "/admin", "/admin.html"], (req, res) => {
-  res.sendFile(path.join(__dirname, "admin.html"));
+  try {
+    res.sendFile(path.join(__dirname, "admin.html"));
+  } catch (err) {
+    res.status(500).send("Admin panel failed to load");
+  }
 });
 
 // GET /bot/status
@@ -368,10 +402,13 @@ app.post("/compress/precompressed", checkAdminKey, upload.array("videos"), async
           try {
             const parsed = JSON.parse(stdout);
             const stream = parsed.streams?.[0] || {};
+            const w = parseInt(stream.width);
+            const h = parseInt(stream.height);
+            const d = parseFloat(stream.duration);
             resolve({
-              width: parseInt(stream.width) || 720,
-              height: parseInt(stream.height) || 1280,
-              duration: parseFloat(stream.duration) || 29.0,
+              width: (w && isFinite(w) && w > 0) ? w : 720,
+              height: (h && isFinite(h) && h > 0) ? h : 1280,
+              duration: (d && isFinite(d) && d > 0) ? d : 29.0,
             });
           } catch (e) {
             resolve({ width: 720, height: 1280, duration: 29.0 });
@@ -404,23 +441,27 @@ app.post("/compress/precompressed", checkAdminKey, upload.array("videos"), async
 
 // GET /status/:jobId (compatibility endpoint for status checks)
 app.get("/status/:jobId", (req, res) => {
-  const job = jobs[req.params.jobId];
-  if (!job) return res.status(404).json({ error: "Job not found" });
+  try {
+    const job = jobs[req.params.jobId];
+    if (!job) return res.status(404).json({ error: "Job not found" });
 
-  res.json({
-    status: job.status,
-    progress: job.progress,
-    totalParts: job.totalParts,
-    segments: job.segments.map((seg) => ({
-      part: seg.part,
-      status: "done",
-      progress: 100,
-      outputSizeMB: seg.outputSizeMB,
-      width: seg.width,
-      height: seg.height,
-      duration: seg.duration,
-    })),
-  });
+    res.json({
+      status: job.status,
+      progress: job.progress,
+      totalParts: job.totalParts,
+      segments: job.segments.map((seg) => ({
+        part: seg.part,
+        status: "done",
+        progress: 100,
+        outputSizeMB: seg.outputSizeMB,
+        width: seg.width,
+        height: seg.height,
+        duration: seg.duration,
+      })),
+    });
+  } catch (err) {
+    res.status(500).json({ error: "Internal status retrieval error" });
+  }
 });
 
 // POST /bot/send-precompressed (direct send helper)
@@ -466,10 +507,13 @@ app.post("/bot/send-precompressed", checkAdminKey, upload.single("video"), async
           try {
             const parsed = JSON.parse(stdout);
             const stream = parsed.streams?.[0] || {};
+            const w = parseInt(stream.width);
+            const h = parseInt(stream.height);
+            const d = parseFloat(stream.duration);
             resolve({
-              width: parseInt(stream.width) || 720,
-              height: parseInt(stream.height) || 1280,
-              duration: parseFloat(stream.duration) || 29.5,
+              width: (w && isFinite(w) && w > 0) ? w : 720,
+              height: (h && isFinite(h) && h > 0) ? h : 1280,
+              duration: (d && isFinite(d) && d > 0) ? d : 29.5,
             });
           } catch (e) {
             reject(e);
@@ -528,24 +572,44 @@ app.post("/bot/send-precompressed", checkAdminKey, upload.single("video"), async
   }
 });
 
-// ── GARBAGE COLLECTION / CLEANUP ───────────────────────────────────────────
-// Periodically cleans up segment files and jobs older than 1 hour to prevent disk fill-up
+// ── GARBAGE COLLECTION & CLEANUP LOOP ─────────────────────────────────────────
+// Periodically cleans up segment files and old uploaded residuals to protect disk
 setInterval(() => {
-  const now = Date.now();
-  const expiryTime = 60 * 60 * 1000; // 1 hour
-  
-  for (const jobId in jobs) {
-    if (now - jobs[jobId].createdAt > expiryTime) {
-      console.log(`[Bot] Expiring Job ${jobId} and cleaning output files...`);
-      for (const seg of jobs[jobId].segments) {
+  try {
+    const now = Date.now();
+    const expiryTime = 60 * 60 * 1000; // 1 hour for job videos
+
+    // 1. Expire registered jobs
+    for (const jobId in jobs) {
+      if (now - jobs[jobId].createdAt > expiryTime) {
+        console.log(`[Bot] Expiring Job ${jobId} and cleaning output files...`);
+        for (const seg of jobs[jobId].segments) {
+          try {
+            if (fs.existsSync(seg.outputPath)) {
+              fs.unlinkSync(seg.outputPath);
+            }
+          } catch (_) {}
+        }
+        delete jobs[jobId];
+      }
+    }
+
+    // 2. Clear any stray files in the uploads temporary folder (older than 15 minutes)
+    if (fs.existsSync(uploadDir)) {
+      const files = fs.readdirSync(uploadDir);
+      for (const file of files) {
         try {
-          if (fs.existsSync(seg.outputPath)) {
-            fs.unlinkSync(seg.outputPath);
+          const filePath = path.join(uploadDir, file);
+          const stat = fs.statSync(filePath);
+          if (now - stat.mtimeMs > 15 * 60 * 1000) {
+            fs.unlinkSync(filePath);
+            console.log(`[Bot] Cleaned stray upload temp file: ${file}`);
           }
         } catch (_) {}
       }
-      delete jobs[jobId];
     }
+  } catch (gcErr) {
+    console.error("[Bot] Garbage collection loop error:", gcErr);
   }
 }, 10 * 60 * 1000); // run every 10 minutes
 
