@@ -330,10 +330,21 @@ app.post("/compress/precompressed", checkAdminKey, upload.array("videos"), async
     try {
       fs.renameSync(file.path, finalPath);
     } catch (err) {
-      console.error("[Bot] Failed to move segment file:", err);
-      // Clean up uploaded temp files
-      req.files.forEach(f => { try { fs.unlinkSync(f.path); } catch (_) {} });
-      return res.status(500).json({ error: "Failed to store segment files" });
+      if (err.code === "EXDEV") {
+        try {
+          fs.copyFileSync(file.path, finalPath);
+          fs.unlinkSync(file.path);
+        } catch (copyErr) {
+          console.error("[Bot] Failed to copy segment file after EXDEV:", copyErr);
+          req.files.forEach(f => { try { fs.unlinkSync(f.path); } catch (_) {} });
+          return res.status(500).json({ error: "Failed to store segment files via copy" });
+        }
+      } else {
+        console.error("[Bot] Failed to move segment file:", err);
+        // Clean up uploaded temp files
+        req.files.forEach(f => { try { fs.unlinkSync(f.path); } catch (_) {} });
+        return res.status(500).json({ error: "Failed to store segment files" });
+      }
     }
 
     const fileSizeMB = fs.statSync(finalPath).size / (1024 * 1024);
