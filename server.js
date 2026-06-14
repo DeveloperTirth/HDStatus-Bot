@@ -512,7 +512,10 @@ app.post("/bot/send-precompressed", checkAdminKey, upload.single("video"), async
           tempFilePath,
         ],
         (err, stdout) => {
-          if (err) return reject(err);
+          if (err) {
+            console.warn("[Bot-Precompressed] ffprobe error, using fallback metadata:", err);
+            return resolve({ width: 720, height: 1280, duration: 29.5 });
+          }
           try {
             const parsed = JSON.parse(stdout);
             const stream = parsed.streams?.[0] || {};
