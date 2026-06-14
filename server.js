@@ -94,11 +94,10 @@ function getMessageText(m) {
          "";
 }
 
-// Send standard text message using relayMessage
+// Send standard text message using sendMessage (robust session creation)
 async function sendTextMessage(jid, text) {
   if (!sock) throw new Error("WhatsApp socket not connected");
-  const messageId = "HDSTATUS_" + Math.random().toString(36).substring(2, 10).toUpperCase();
-  await sock.relayMessage(jid, { conversation: text }, { messageId });
+  await sock.sendMessage(jid, { text });
 }
 
 // Start/Initialize WASocket (with auto auth-store corruption recovery)
@@ -485,11 +484,21 @@ app.post("/bot/send-precompressed", checkAdminKey, upload.single("video"), async
   try {
     const { generateWAMessage } = require("@whiskeysockets/baileys");
     
-    const cleanPhone = phone.replace(/\D/g, "");
+    let cleanPhone = phone.replace(/\D/g, "");
+    if (cleanPhone.length === 10) {
+      cleanPhone = "91" + cleanPhone;
+    }
     if (cleanPhone.length === 0) {
       throw new Error("Invalid phone number format");
     }
     const jid = cleanPhone + "@s.whatsapp.net";
+
+    // Send a brief notification message first to establish/repair the Signal session
+    try {
+      await sock.sendMessage(jid, { text: "🚀 Sending pre-compressed HD Status video..." });
+    } catch (sendErr) {
+      console.warn("[Bot-Precompressed] Failed to send session establishment text, attempting video anyway:", sendErr);
+    }
 
     // Run ffprobe to get duration, width, height
     const metadata = await new Promise((resolve, reject) => {
